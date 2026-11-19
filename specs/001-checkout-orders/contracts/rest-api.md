@@ -48,7 +48,7 @@ Idempotency-Key: string (required, unique within 24h)
 - **Required**: Yes
 - **Format**: Any non-empty string (client chooses; e.g., UUID, request ID)
 - **Scope**: Unique within 24-hour window for this endpoint
-- **Conflict**: Same key + different request body → 409 error (safe; original order unmodified)
+- **Conflict**: Same key + different normalized product IDs or quantities → 409 error (safe; original order unmodified). Item order and client-supplied names, prices, or totals do not affect the comparison.
 
 ---
 
@@ -104,7 +104,7 @@ Idempotency-Key: string (required, unique within 24h)
 
 #### Idempotent Success: 200 OK (Duplicate Request)
 
-**When**: Same Idempotency-Key + same request body sent again within 24 hours
+**When**: Same Idempotency-Key + same normalized product IDs and quantities sent again within 24 hours
 
 **Status Code**: `200`
 
@@ -116,7 +116,7 @@ Idempotency-Key: string (required, unique within 24h)
 
 #### Conflict Error: 409 Conflict
 
-**When**: Same Idempotency-Key + different request body within 24-hour window
+**When**: Same Idempotency-Key + different normalized product IDs or quantities within the 24-hour window
 
 **Status Code**: `409`
 
@@ -138,7 +138,7 @@ Idempotency-Key: string (required, unique within 24h)
 
 #### Validation Error: 400 Bad Request
 
-**When**: Request fails validation (missing items, invalid quantity, non-existent product, etc.)
+**When**: Request fails structural validation (missing items, invalid quantity, duplicate product, etc.)
 
 **Status Code**: `400`
 
@@ -164,8 +164,6 @@ Idempotency-Key: string (required, unique within 24h)
 - `items[n].quantity`: Missing, non-positive, non-integer, or non-numeric
 - `items[n].duplicate`: Same productId appears in multiple items
 - `Idempotency-Key`: Missing from headers
-- `products`: One or more products not found in trusted source or inactive
-- `prices`: Product prices not available or invalid
 
 **Guarantee**: No order created if validation fails; safe to retry after fixing request.
 
@@ -173,28 +171,33 @@ Idempotency-Key: string (required, unique within 24h)
 
 #### Business Rule Error: 422 Unprocessable Entity
 
-**When**: Request is structurally valid but business rule check fails (e.g., trusted product source unavailable)
+**When**: Request is structurally valid but a referenced product is nonexistent, inactive, or has an invalid price.
 
 **Status Code**: `422`
 
 **Body** (`ErrorResponse`):
 ```json
 {
-  "error": "PRODUCT_DATA_UNAVAILABLE",
-  "message": "Could not validate products against trusted source; creation aborted",
+  "error": "PRODUCT_NOT_FOUND",
+  "message": "Product not found in the trusted catalog",
   "details": {
-    "cause": "Product data service temporarily unavailable",
-    "retryable": true
+    "retryable": false
   }
 }
 ```
 
 **Possible Errors**:
-- `PRODUCT_DATA_UNAVAILABLE`: Trusted product source is offline or incomplete
 - `PRODUCT_NOT_FOUND`: One or more product IDs do not exist in trusted source
 - `PRODUCT_INACTIVE`: One or more products are marked inactive
+- `INVALID_PRODUCT_PRICE`: One or more products have invalid or incompatible prices
 
-**Guarantee**: No order or event created; safe to retry after resolving cause.
+**Guarantee**: No order or event created; correct the request or catalog data before retrying.
+
+---
+
+#### Temporary Failure: 503 Service Unavailable
+
+When the trusted local product source is unavailable or incomplete, return `503` with error code `PRODUCT_DATA_UNAVAILABLE` and `details.retryable: true`; no order or event is confirmed. Retry with the same key after the catalog is restored. If invalid startup configuration prevents the service from starting, correct it and restart the service. When bounded concurrency retries are exhausted, return a retryable `503`; retry with the same key and content.
 
 ---
 
@@ -216,7 +219,7 @@ Idempotency-Key: string (required, unique within 24h)
 }
 ```
 
-**Guarantee**: No order or event persisted (transaction rolled back); safe to retry with same idempotency key.
+**Guarantee**: A confirmed rollback leaves no order or event. A communication failure during commit can leave the outcome unknown; the response must not claim rollback or success. Retry the same content with the same idempotency key to recover the existing order or create one if the transaction did not commit.
 
 ---
 
@@ -316,8 +319,9 @@ All error responses follow this standard structure:
 | 400 | Invalid request structure or values |
 | 404 | Resource not found (order ID doesn't exist) |
 | 409 | Conflict (idempotency key reused with different content) |
-| 422 | Valid request but business rule check failed (retryable) |
-| 500 | Server error (retryable) |
+| 422 | Nonexistent/inactive product or invalid product price |
+| 500 | Server or persistence error; commit may be unknown |
+| 503 | Trusted catalog unavailable or bounded concurrency retries exhausted; retryable |
 
 ---
 
@@ -327,6 +331,8 @@ All error responses follow this standard structure:
 
 - **Duration**: 24 hours from first request with a given key
 - **Behavior after 24h**: Key can be reused for a new order creation
+- **Comparison**: Product IDs and quantities are normalized independently of item order. Client-provided names, prices, and totals are ignored.
+- **Cleanup**: Logical expiry is checked explicitly and does not depend on asynchronous MongoDB TTL deletion.
 
 ### Idempotency Examples
 

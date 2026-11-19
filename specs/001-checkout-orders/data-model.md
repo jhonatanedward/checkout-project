@@ -17,10 +17,10 @@
 |-------|------|-----------|---|
 | `id` | UUID | PK, Generated | Unique order identifier |
 | `status` | Enum | {CREATED, CANCELLED} | Current state; initially CREATED |
-| `totalAmount` | BigDecimal | > 0, precision 2 | Total in configured currency (calculated server-side) |
+| `totalAmount` | BigDecimal | > 0, exactly representable to 2 decimal places | Total in configured currency (calculated server-side) |
 | `currency` | String | Fixed length 3 (e.g., "USD") | Currency code for all prices in order |
 | `items` | List[OrderItem] | 1+ items | Snapshot of products at creation time |
-| `idempotencyKey` | String | Unique within 24h | Used to detect and prevent duplicates |
+| `idempotencyKey` | String | Non-unique historical value | Key used at creation; uniqueness is enforced by the active idempotency record, not by orders |
 | `createdAt` | Instant | Immutable | Timestamp of order creation (server-side) |
 | `createdBy` | String | Optional | Client identifier or IP (optional for future audit trail) |
 
@@ -48,13 +48,14 @@
 | `productId` | String | Unique within Order | Reference to product in trusted source |
 | `productName` | String | Immutable snapshot | Product name at order creation time |
 | `quantity` | Integer | > 0 | Quantity ordered (must be positive) |
-| `unitPrice` | BigDecimal | > 0, precision 2 | Price per unit at order creation time |
+| `unitPrice` | BigDecimal | > 0, exactly representable to 2 decimal places | Price per unit at order creation time |
 | `subtotal` | BigDecimal | Calculated | Quantity × UnitPrice |
 
 **Validation Rules**:
 - ProductId must exist in trusted product source
 - Quantity must be positive integer
 - UnitPrice must match trusted source at creation time
+- Prices and totals use the one configured currency; reject incompatible currency, values requiring rounding, and values not representable as MongoDB Decimal128.
 - No modification after order creation
 
 **Embedded in**: Order.items array
@@ -100,7 +101,7 @@
 }
 ```
 
-**MongoDB Collection**: `order_events`
+**MongoDB Collection**: `order_events` (outbox; no worker or broker publishing in this increment)
 
 ---
 
@@ -112,17 +113,18 @@
 | Field | Type | Constraints | Description |
 |-------|------|-----------|---|
 | `id` | UUID | PK, Generated | Record identifier |
-| `key` | String | Unique(key, contentHash) | Idempotency key from client request |
+| `key` | String | Unique | Idempotency key from client request |
 | `contentHash` | String | SHA-256 hash | Hash of normalized request body for conflict detection |
-| `orderId` | UUID | FK → Order.id, Nullable | Reference to order if creation succeeded |
+| `orderId` | UUID | FK → Order.id | Reference to order in the committed record |
 | `createdAt` | Instant | Immutable | When key was first seen |
-| `expiresAt` | Instant | Immutable, TTL | Auto-delete after 24 hours |
+| `expiresAt` | Instant | TTL | Logical expiry at 24 hours; TTL deletion may be delayed |
 
 **Validation Rules**:
 - Key must be non-empty string (client-provided)
 - ContentHash uniquely identifies request content
-- Composite unique index on (key, contentHash) ensures single order per unique request
-- TTL index on expiresAt removes records automatically after 24 hours
+- Unique index on key prevents multiple records for the same key; contentHash is compared by the use case.
+- Expiration is checked explicitly; an expired record can be atomically replaced even before asynchronous TTL cleanup.
+- The claim and completed record participate in the same transaction as the order and event; a committed record has an orderId.
 
 **Conflict Resolution**:
 1. Same key + same content → Return existing orderId (idempotent)
@@ -140,7 +142,7 @@ Order (1) ──────────────── (N) OrderItem
   ├─ inherits idempotencyKey
   └─ generates (1) OrderCreatedEvent
 
-IdempotencyKey → Order (optional, until creation succeeds)
+IdempotencyKey → Order (one committed order)
 
 OrderCreatedEvent → Order (1-to-1, one event per order)
 ```
@@ -148,7 +150,7 @@ OrderCreatedEvent → Order (1-to-1, one event per order)
 **Transaction Boundary**:
 - Order creation and OrderCreatedEvent persistence happen in a single atomic transaction
 - IdempotencyKey is checked and created within the same transaction
-- If any part fails, entire transaction rolls back
+- A confirmed rollback leaves no order, event, or idempotency record. A communication failure during commit can leave the outcome unknown; the retry uses the same key and content.
 
 ---
 
@@ -159,8 +161,7 @@ OrderCreatedEvent → Order (1-to-1, one event per order)
 **Document Structure**:
 ```json
 {
-  "_id": ObjectId,
-  "id": "uuid",
+  "_id": "uuid",
   "status": "CREATED",
   "totalAmount": 99.99,
   "currency": "USD",
@@ -189,8 +190,7 @@ OrderCreatedEvent → Order (1-to-1, one event per order)
 **Indexes**:
 | Index | Fields | Unique | Purpose |
 |-------|--------|--------|---------|
-| Primary | `{_id: 1}` | Yes | MongoDB default |
-| ID Lookup | `{id: 1}` | Yes | Fast order retrieval by business ID |
+| Primary | `{_id: 1}` | Yes | Business UUID stored as the MongoDB identifier |
 | IdempotencyKey | `{idempotencyKey: 1}` | No | Support idempotency checks (with transaction) |
 | Status+CreatedAt | `{status: 1, createdAt: -1}` | No | Support future queries by status/date |
 
@@ -234,18 +234,17 @@ OrderCreatedEvent → Order (1-to-1, one event per order)
   "id": "uuid",
   "key": "client-provided-key-123",
   "contentHash": "sha256-hash-of-request-body",
-  "orderId": "uuid (FK, nullable until order created)",
+  "orderId": "uuid (FK)",
   "createdAt": ISODate("2026-11-19T12:00:00Z"),
   "expiresAt": ISODate("2026-11-20T12:00:00Z")
 }
 ```
 
 **Indexes**:
-| Index | Fields | Unique | Partial Filter | Purpose |
-|-------|--------|--------|-----------------|---------|
-| Composite | `{key: 1, contentHash: 1}` | Yes | `{expiresAt: {$gt: now}}` | Enforce unique request within window |
-| TTL | `{expiresAt: 1}` | No | — | Auto-delete after expiration |
-| OrderId | `{orderId: 1}` | No | `{orderId: {$exists: true}}` | Optional: support cleanup by order |
+| Index | Fields | Unique | Purpose |
+|-------|--------|--------|---------|
+| Key | `{key: 1}` | Yes | One current record per key, regardless of content |
+| TTL | `{expiresAt: 1}` | No | Cleanup after expiration, `expireAfterSeconds: 0`; not the expiration boundary |
 
 ---
 
@@ -269,15 +268,14 @@ OrderCreatedEvent → Order (1-to-1, one event per order)
    - Total > 0
 
 4. **Idempotency Check**:
-   - Query IdempotencyKey collection for (key, contentHash)
-   - If found and not expired:
-     - If orderId set: return existing order (idempotent success)
-     - If orderId null: creation in progress or failed; fail safely
-   - If not found or expired: proceed with order creation
+   - Look up the key and compare the normalized content hash when it is unexpired.
+   - Same content returns the committed order before catalog lookup; different content is rejected.
+   - If absent or expired, atomically claim or replace the record inside the creation transaction.
+   - On a duplicate-key/write conflict, retry or re-read after the aborted transaction in a fresh transaction; bound retries.
 
 5. **Atomicity Check**:
    - Both Order and OrderCreatedEvent must persist in single transaction
-   - If transaction fails: neither record persists; safe to retry
+   - A confirmed rollback leaves neither record; unknown commit outcomes must not be reported as confirmed rollback. Retrying with the same key and content is safe.
 
 ---
 
@@ -309,7 +307,7 @@ mongodb://mongodb-host:27017/checkout-service
 
 **Spring Boot Application Properties**:
 ```properties
-spring.data.mongodb.uri=mongodb://mongodb-host:27017/checkout-service
+spring.mongodb.uri=mongodb://mongodb-host:27017/checkout-service?replicaSet=rs0
 spring.data.mongodb.auto-index-creation=true
 ```
 

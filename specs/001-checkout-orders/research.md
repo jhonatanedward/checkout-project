@@ -9,28 +9,27 @@
 ## Research Topic 1: MongoDB Multi-Document Transactions in Spring Boot
 
 ### Decision
-**Chosen**: Use Spring Framework `@Transactional` annotation with Spring Data MongoDB repositories to manage multi-document transactions at the application boundary (CreateOrderUseCase). MongoDB's client-side session management (automatically handled by Spring Data MongoDB 3.x) provides ACID guarantees for operations on a single shard, which is sufficient for P1 scope.
+**Chosen**: Use Spring Boot 4.1.2 and a Spring infrastructure adapter with `@Transactional` and `MongoTransactionManager`. The framework-free use case invokes a transaction port; its order, `order_events` outbox, and idempotency writes share the same MongoDB transaction.
 
 ### Rationale
 1. **Spring Integration**: `@Transactional` is the idiomatic approach in Spring Boot; Spring Data MongoDB automatically manages MongoDB sessions and transaction state.
-2. **Multi-Document Atomicity**: MongoDB 4.0+ supports multi-document ACID transactions within a single shard. For a single checkout service and dedicated database, this is acceptable without sharding complexity.
+2. **Multi-Document Atomicity**: A MongoDB replica set supports the required multi-document transaction; no sharding is required for this increment.
 3. **Simplicity for P1**: Avoids manual session/transaction management; focus remains on domain logic and idempotency.
-4. **Clear Boundaries**: Transaction scope is explicit at the use-case level (create order + persist event as one unit).
+4. **Clear Boundaries**: The application owns the business decisions and the transaction port; the Spring adapter owns transaction mechanics.
 
 ### Configuration
-- **Spring Data MongoDB**: Version 3.4.x or higher (bundled with Spring Boot 3.1+)
-- **MongoDB Driver**: 4.8+ (supports transactions)
-- **Transactional Method**: Place `@Transactional` on `CreateOrderUseCase.createOrder()` to ensure both order and event persist atomically.
-- **Session Lifetime**: Automatically managed by Spring; no manual session creation required.
+- **Spring Boot**: Keep the existing Maven parent at 4.1.2 and use its managed dependency versions.
+- **Database configuration**: Set `spring.mongodb.uri` to a replica-set URI with the dedicated `checkout-service` database.
+- **Transactional Method**: Annotate the Spring-managed transaction adapter, not `CreateOrderUseCase`. Use the same `MongoDatabaseFactory` for `MongoTransactionManager` and `MongoTemplate`.
+- **Session Lifetime**: Managed by Spring for participating operations; calls must cross the transactional proxy.
 
 ### Failure Scenario Handling
-- If order persists but event fails → transaction rolls back; no order remains in DB
-- If event persists but order fails → transaction rolls back; no event remains in DB
-- If network fails mid-transaction → MongoDB automatically aborts; client receives error; safe to retry with idempotency key
+- If a write fails and rollback is confirmed, neither order, event, nor idempotency record remains.
+- A network failure during commit can leave the outcome unknown. Report a retryable failure without claiming rollback; retry with the same key and content to resolve the committed order or create one if no commit occurred.
 
 ### Alternatives Considered
 1. **Manual MongoDB Session Management**: More verbose, error-prone; @Transactional is preferred.
-2. **Outbox Pattern**: Would add complexity (separate outbox collection, additional processing) for P1; deferred to future increments.
+2. **Broker publishing now**: Requires a worker and delivery semantics outside this increment; persist only the outbox record now.
 3. **Eventual Consistency (async events)**: Contradicts P1 requirement for atomic persistence; rejected.
 
 ---
@@ -38,16 +37,13 @@
 ## Research Topic 2: Idempotency Key Management Strategy (24-Hour Deduplication Window)
 
 ### Decision
-**Chosen**: Store idempotency keys in a dedicated MongoDB collection (`idempotency_keys`) with:
-- Composite unique index on `(key, orderContent hash)` to detect content conflicts
-- TTL index set to 86400 seconds (24 hours) to auto-delete expired keys
-- Simple synchronous lookup before order creation
+**Chosen**: Store one record per key in `idempotency_keys` with a unique key index, a hash of normalized product IDs and quantities, and `expiresAt` set 24 hours after creation. An `expiresAt` TTL index is only asynchronous cleanup; application logic checks expiration and atomically replaces an expired record without waiting for TTL deletion.
 
 ### Rationale
-1. **Atomic Conflict Detection**: Unique index on (key + content hash) ensures conflicting requests are rejected before order creation attempt.
-2. **Automatic Cleanup**: TTL index removes keys after 24 hours; no manual scheduled cleanup needed.
-3. **Simplicity**: Single collection query; no distributed locking complexity for P1.
-4. **Failure Handling**: If idempotency storage fails, the transaction as a whole fails (safe retry).
+1. **Atomic Conflict Detection**: A unique index on the key prevents simultaneous records with different hashes.
+2. **Cleanup**: TTL deletion may be delayed; explicit expiration makes the 24-hour boundary independent of it.
+3. **Concurrency**: After a duplicate-key/write conflict aborts a transaction, re-read or retry in a fresh transaction; bound retries and report exhaustion as retryable.
+4. **Failure Handling**: The key claim, order, and event commit together; an unknown commit outcome is resolved by a same-key retry.
 
 ### Schema (idempotency_keys collection)
 ```json
@@ -62,18 +58,19 @@
 ```
 
 **Indexes**:
-- Unique compound index: `{key: 1, contentHash: 1}` with partial filter `{expiresAt: {$gt: now}}`
+- Unique index: `{key: 1}`
 - TTL index: `{expiresAt: 1}` with `expireAfterSeconds: 0`
 
 ### Conflict Handling
 1. **Same key, same content**: Return existing order (idempotent success)
 2. **Same key, different content**: Reject with HTTP 409 Conflict (preserve original order)
 3. **New key**: Proceed with order creation
+4. **Expired key**: Atomically replace its record and proceed, whether TTL cleanup has run or not.
 
 ### Alternatives Considered
 1. **Outbox + Event Sourcing**: Over-engineered for P1; deferred.
 2. **In-Memory Cache (Redis)**: External dependency; MongoDB provides TTL natively.
-3. **Soft Deletes with Scheduled Cleanup**: Manual cleanup is error-prone; TTL index is automatic and reliable.
+3. **TTL as the deduplication boundary**: Rejected because deletion is asynchronous and may occur after expiration.
 4. **Hash-based Deduplication Only**: Cannot detect content conflicts; rejected.
 
 ---
@@ -93,15 +90,7 @@
 4. **Database Isolation**: Dedicated checkout-service database ensures no conflicts with other services.
 
 ### Key Configuration Points
-```java
-@Configuration
-public class MongoConfig {
-    @Bean
-    public MongoTransactionManager transactionManager(MongoClient mongoClient) {
-        return new MongoTransactionManager(mongoClient.getDatabase("checkout-service"));
-    }
-}
-```
+Register `MongoTransactionManager` with the same `MongoDatabaseFactory` used by `MongoTemplate`; transactions require a replica set. See [Spring Data MongoDB transactions](https://docs.spring.io/spring-data/mongodb/reference/mongodb/client-session-transactions.html).
 
 ### Testing Strategy
 1. **Unit Tests** (OrderTest, OrderItemTest): Test domain objects; no database needed.
@@ -113,25 +102,7 @@ public class MongoConfig {
 3. **Contract Tests** (OrderControllerTest): Mock repositories; focus on REST mapping and error responses.
 
 ### Dependencies (pom.xml)
-```xml
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-data-mongodb</artifactId>
-    <version>3.2.0</version>
-</dependency>
-<dependency>
-    <groupId>org.testcontainers</groupId>
-    <artifactId>testcontainers</artifactId>
-    <version>1.19.0</version>
-    <scope>test</scope>
-</dependency>
-<dependency>
-    <groupId>org.testcontainers</groupId>
-    <artifactId>mongodb</artifactId>
-    <version>1.19.0</version>
-    <scope>test</scope>
-</dependency>
-```
+Add the MongoDB starter and MongoDB Testcontainers test dependencies using versions compatible with the existing Spring Boot 4.1.2 parent; do not pin Spring Boot 3.x starters.
 
 ### Alternatives Considered
 1. **JPA + SQL Database**: Requires complex transaction management for multi-entity writes; MongoDB is simpler for document-oriented data.
@@ -143,13 +114,13 @@ public class MongoConfig {
 ## Research Topic 4: Outbox Pattern vs. Direct Event Persistence
 
 ### Decision
-**Chosen**: For P1, implement **direct atomic persistence** of order + event in a single transaction (not outbox pattern). Event records are stored in a separate `order_events` collection to separate concerns, but both writes happen in one transaction.
+**Chosen**: `order_events` is the outbox collection. Persist each creation event in the same transaction as the order and idempotency record. A worker and broker publication are out of scope.
 
 ### Rationale
-1. **P1 Scope**: Broker publishing is out-of-scope; no outbox pattern needed yet.
+1. **P1 Scope**: Broker publishing and worker execution are out of scope; the outbox record is persisted now.
 2. **Atomicity Requirement**: Core requirement is that order and event persist together or fail together; @Transactional satisfies this.
-3. **Simplicity**: One collection (orders) + event collection (order_events) in a single transaction is cleaner than outbox.
-4. **Evolutionary**: When P2 adds broker publishing, outbox can be introduced without changing domain logic (application layer insertion point).
+3. **Simplicity**: `order_events` is the one event/outbox collection; do not create a second collection.
+4. **Evolutionary**: A later increment can define worker state, retries, and delivery semantics for the existing outbox.
 
 ### Schema (order_events collection)
 ```json
@@ -168,11 +139,7 @@ public class MongoConfig {
 ```
 
 ### Outbox Introduction Path (Post-P1)
-When P2 requires broker publishing:
-1. Add `outbox_events` collection
-2. Keep atomic write of order + order_events in P1 semantics
-3. Introduce background job to publish outbox_events to broker
-4. Maintain both tables until broker consumer confirms processing
+When a later increment requires broker publishing, design the worker and delivery-state semantics around the existing `order_events` collection; do not add a duplicate event collection.
 
 ### Alternatives Considered
 1. **Full Outbox Pattern Now**: Unnecessary complexity; deferred to P2.
@@ -186,10 +153,10 @@ When P2 requires broker publishing:
 
 | Topic | Decision | Trade-off |
 |-------|----------|-----------|
-| Transactions | Spring @Transactional + MongoDB multi-doc ACID | Requires single shard; sufficient for P1 |
-| Idempotency | Dedicated collection + TTL index + content hash | Adds one query per request; reliable 24h window |
+| Transactions | Spring @Transactional adapter + MongoDB multi-doc ACID | Requires a replica set and transaction manager |
+| Idempotency | Unique key, explicit expiry, TTL cleanup, and content hash | Atomic replacement handles the 24-hour boundary even when TTL is delayed |
 | MongoDB Integration | Spring Data MongoDB + Testcontainers | External dependency; standard in Spring ecosystem |
-| Event Persistence | Direct atomic write + separate collection (no outbox) | Outbox added later when broker publishing needed |
+| Event Persistence | `order_events` is the outbox written atomically | Worker and broker publication deferred |
 
 All decisions maintain **hexagonal architecture principles**: business rules isolated in domain layer, use cases orchestrate atomic operations, MongoDB detail hidden behind repository ports.
 

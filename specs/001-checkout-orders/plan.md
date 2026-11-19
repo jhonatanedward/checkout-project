@@ -1,6 +1,6 @@
 # Implementation Plan: Checkout de Pedidos
 
-**Branch**: `001-checkout-orders` | **Date**: 2026-11-19 | **Spec**: [spec.md](./spec.md)
+**Current branch**: `main` | **Feature directory**: `001-checkout-orders` | **Date**: 2026-11-19 | **Spec**: [spec.md](./spec.md)
 
 **Input**: Feature specification from `/specs/001-checkout-orders/spec.md`
 
@@ -10,13 +10,13 @@ Implementar o incremento P1 de criação e consulta de pedidos em um serviço de
 
 ## Technical Context
 
-**Language/Version**: Java 21 (Spring Boot 3.x)
+**Language/Version**: Java 21, Spring Boot 4.1.2 (existing Maven parent)
 
 **Primary Dependencies**: Spring Framework (MVC/REST), Spring Data MongoDB, MongoDB
 
-**Storage**: MongoDB - collections de pedidos e outbox em banco de dados dedicado ao serviço de checkout
+**Storage**: MongoDB database `checkout-service`; collections `orders`, `order_events` (outbox), and `idempotency_keys`; connection via `spring.mongodb.uri`.
 
-**Transactions**: Spring @Transactional com suporte a transações multi-documento do MongoDB
+**Transactions**: A Spring-managed infrastructure adapter uses `@Transactional` and `MongoTransactionManager` backed by the same `MongoDatabaseFactory` as `MongoTemplate`. The framework-free use case executes the atomic work through a transaction port; order, outbox event, and idempotency record share the transaction. A replica set is required.
 
 **Testing**: JUnit 5, Testcontainers (MongoDB), Mockito
 
@@ -24,11 +24,15 @@ Implementar o incremento P1 de criação e consulta de pedidos em um serviço de
 
 **Project Type**: Web service / REST API (checkout)
 
-**Performance Goals**: Latência aceitável em criação de pedido (<500ms p95); suporte a múltiplas criações concorrentes sem duplicação
+**Performance Goals**: No latency target is specified for this increment; concurrent creation must preserve the idempotency and atomicity guarantees.
 
 **Constraints**: Consistência atômica (pedido + evento sempre juntos); deduplicação por 24 horas; rejeição de pedidos parciais
 
 **Scale/Scope**: Foco inicial no P1; extensível para pagamentos, estoque, broker em incrementos futuros
+
+**Idempotency and failures**: Normalize product IDs and quantities independently of item order. A unique index on the key serializes claims; expiry is checked explicitly and an expired record may be replaced atomically without waiting for TTL cleanup. Duplicate-key/write conflicts are resolved after the failed transaction ends by retrying in a fresh transaction or re-reading the committed record; retries are bounded and exhaustion is reported as retryable. If commit outcome is unknown, do not claim rollback or create a new key: report a retryable error and retry with the same key and content.
+
+**Catalog and money**: The local controlled catalog uses one configured currency; positive prices and totals must be exactly representable to two decimal places without rounding. Missing, invalid, or unavailable catalog data fails explicitly; a corrected configuration may require a service restart. Tests simulate temporary catalog unavailability and recovery without requiring production hot reload.
 
 ## Constitution Check
 
@@ -59,56 +63,23 @@ specs/001-checkout-orders/
 
 ```text
 services/checkout-service/
-├── src/main/java/com/checkout/
-│   ├── domain/              # Núcleo: entities, value-objects, business rules
-│   │   ├── order/
-│   │   │   ├── Order.java
-│   │   │   ├── OrderItem.java
-│   │   │   ├── OrderId.java
-│   │   │   └── OrderStatus.java
-│   │   ├── product/
-│   │   │   ├── TrustedProduct.java
-│   │   │   └── TrustedProductRepository.java (porta)
-│   │   ├── idempotency/
-│   │   │   ├── IdempotencyKey.java
-│   │   │   └── IdempotencyKeyRepository.java (porta)
-│   │   └── event/
-│   │       ├── OrderCreatedEvent.java
-│   │       └── OrderEventRepository.java (porta)
-│   │
-│   ├── application/        # Casos de uso
-│   │   ├── CreateOrderUseCase.java
-│   │   └── GetOrderUseCase.java
-│   │
-│   ├── infrastructure/      # Adaptadores
-│   │   ├── rest/
-│   │   │   └── OrderController.java
-│   │   ├── persistence/
-│   │   │   ├── MongoOrderRepository.java
-│   │   │   ├── MongoIdempotencyRepository.java
-│   │   │   ├── MongoOrderEventRepository.java
-│   │   │   ├── LocalTrustedProductRepository.java
-│   │   │   └── OrderDocument.java (MongoDB document)
-│   │   └── config/
-│   │       └── CheckoutConfig.java
-│   │
-│   └── CheckoutApplication.java
-│
-├── src/test/java/com/checkout/
-│   ├── domain/
-│   │   └── order/OrderTest.java
+├── src/main/java/dev/edward/ecommerce/checkout_service/
+│   ├── domain/              # Pedido, item, produto, idempotência e evento
 │   ├── application/
-│   │   ├── CreateOrderUseCaseTest.java
-│   │   └── GetOrderUseCaseTest.java
-│   └── infrastructure/
-│       ├── rest/OrderControllerTest.java
-│       └── persistence/MongoRepositoryTest.java (Testcontainers)
-│
+│   │   ├── order/           # Casos de uso de criar e consultar
+│   │   └── port/out/        # Portas de catálogo, persistência e transação
+│   ├── infrastructure/      # Adaptadores REST, catálogo, MongoDB e configuração
+│   └── CheckoutServiceApplication.java
+├── src/main/resources/application.yaml
+├── src/test/java/dev/edward/ecommerce/checkout_service/
+│   ├── domain/              # Testes unitários
+│   ├── application/         # Testes de casos de uso
+│   └── infrastructure/      # Testes de adaptadores e integração
 ├── pom.xml
-└── README.md
+└── mvnw.cmd
 ```
 
-**Structure Decision**: Arquitetura hexagonal com separação clara entre domínio (entities, regras de negócio), aplicação (casos de uso), e adaptadores (REST, MongoDB). MongoDB em coleções dedicadas (checkout-db) com suporte a transações multi-documento. Spring @Transactional garante atomicidade pedido+evento.
+**Structure Decision**: Arquitetura hexagonal com domínio e casos de uso independentes de frameworks; adaptadores REST, catálogo local e MongoDB usam portas do núcleo. O banco dedicado `checkout-service` contém pedidos, outbox `order_events` e chaves de idempotência. O adaptador transacional Spring protege a operação completa.
 
 ## Phase 1: Design & Contracts (COMPLETE)
 
@@ -123,32 +94,24 @@ services/checkout-service/
 - **Indexes**: Unique constraints, TTL cleanup, query optimization
 
 #### 2. REST API Contracts (`contracts/rest-api.md`) ✓
-- **POST /api/v1/orders**: Create order (201, 200 idempotent, 400 validation, 409 conflict, 422 business rule, 500 error)
+- **POST /api/v1/orders**: Create order (201, 200 idempotent, 400 validation, 409 conflict, 422 product rule, 500 error, 503 temporary unavailability)
 - **GET /api/v1/orders/{orderId}**: Retrieve order (200, 404)
 - **Idempotency Semantics**: 24-hour window, same key + same content = idempotent, same key + different content = 409
 - **Error Response Format**: Standard error structure with details
 
 #### 3. Quickstart & Validation (`quickstart.md`) ✓
-- **6 Validation Scenarios**:
-  1. Create valid order (total calculation, trusted source, retrieval)
-  2. Idempotent repetition (same order, no duplicate)
-  3. Conflict detection (different content, 409 response)
-  4. Validation failures (empty, negative, non-existent, duplicate products)
-  5. Atomic persistence (rollback, no partial state)
-  6. Snapshot preservation (product data changes don't affect order)
-- **Setup Instructions**: Prerequisites, MongoDB startup, service startup
-- **Troubleshooting**: Common issues and solutions
-- **Success Criteria Validation**: All SC-001 through SC-006 covered
+- **Validation**: Setup, create/lookup, replay, conflict, expiration, transaction failures, catalog recovery and snapshot preservation.
+- **SC-005**: The 90% user-success criterion requires a separate user test; automated HTTP tests alone do not measure it.
 
 #### 4. Project Structure
 ```
 services/checkout-service/
-├── src/main/java/com/checkout/
+├── src/main/java/dev/edward/ecommerce/checkout_service/
 │   ├── domain/           → Entities, value-objects, business rules
 │   ├── application/      → Use cases (CreateOrderUseCase, GetOrderUseCase)
 │   ├── infrastructure/   → REST, MongoDB, configuration
-│   └── CheckoutApplication.java
-├── src/test/java/com/checkout/
+│   └── CheckoutServiceApplication.java
+├── src/test/java/dev/edward/ecommerce/checkout_service/
 │   ├── domain/           → Entity tests
 │   ├── application/      → Use case tests
 │   └── infrastructure/   → Controller and repository tests
@@ -190,7 +153,7 @@ No complexity violations. MongoDB transactions justified by P1 requirement for a
 - Quickstart guide with 6 validation scenarios
 - Project structure aligned with hexagonal architecture
 
-**Phase 2: Tasks** → Requires `/speckit-tasks` command (not part of plan phase)
+**Phase 2: Tasks** ✓ Generated in `tasks.md`; implementation remains pending.
 
 ---
 
@@ -199,11 +162,11 @@ No complexity violations. MongoDB transactions justified by P1 requirement for a
 ```
 specs/001-checkout-orders/
 ├── plan.md                           # This file (planning output)
-├── research.md                       # Phase 0: Technology decisions & alternatives (9.6 KB)
-├── data-model.md                     # Phase 1: Entities, MongoDB schema, relationships (10.7 KB)
-├── quickstart.md                     # Phase 1: Validation scenarios, troubleshooting (14.8 KB)
+├── research.md                       # Phase 0: Technology decisions & alternatives
+├── data-model.md                     # Phase 1: Entities, MongoDB schema, relationships
+├── quickstart.md                     # Phase 1: Validation guide
 └── contracts/
-    └── rest-api.md                   # Phase 1: API contracts, error responses (11 KB)
+    └── rest-api.md                   # Phase 1: API contracts, error responses
 ```
 
 ---
@@ -211,8 +174,8 @@ specs/001-checkout-orders/
 ## Next Steps
 
 ### For Implementation
-1. Run `/speckit-tasks` to generate dependency-ordered task list in `tasks.md`
-2. Create feature branch from `001-checkout-orders` for implementation
+1. Review the dependency-ordered task list in `tasks.md`
+2. Implement the tasks on the chosen working branch
 3. Follow hexagonal architecture pattern:
    - Domain layer: entities, validation rules, business logic
    - Application layer: use cases (CreateOrderUseCase, GetOrderUseCase)
@@ -229,6 +192,8 @@ specs/001-checkout-orders/
 
 ---
 
-**Status**: Ready for task generation and implementation  
-**Branch**: 001-checkout-orders  
+**Status**: Tasks generated; implementation pending
+
+**Feature directory**: 001-checkout-orders
+
 **Review**: Constitution compliant; design complete; artifacts generated
