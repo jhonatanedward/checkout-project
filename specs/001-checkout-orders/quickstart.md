@@ -18,7 +18,7 @@ Set-Location .\services\checkout-service
 .\mvnw.cmd verify
 ```
 
-`test` executa os testes unitários; `verify` também executa os testes `*IT` via Failsafe com MongoDB Testcontainers em replica set. Espera-se sucesso em ambos, incluindo:
+`test` executa os testes unitários e o teste de contexto Spring; esse contexto usa MongoDB Testcontainers quando Docker está disponível. `verify` também executa os testes `*IT` via Failsafe com MongoDB em replica set. Docker é necessário para executar os testes que usam Testcontainers; sem Docker, eles são ignorados. Espera-se sucesso em ambos, incluindo:
 
 - total exato e validação de itens, moeda e preço;
 - snapshot mantido mesmo após alteração do produto;

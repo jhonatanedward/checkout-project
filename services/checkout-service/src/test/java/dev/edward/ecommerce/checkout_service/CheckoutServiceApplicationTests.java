@@ -1,10 +1,12 @@
 package dev.edward.ecommerce.checkout_service;
 
 import org.junit.jupiter.api.Test;
-import org.springframework.boot.test.context.SpringBootTest;
+import org.testcontainers.junit.jupiter.Testcontainers;
 
-@SpringBootTest
-class CheckoutServiceApplicationTests {
+import dev.edward.ecommerce.checkout_service.infrastructure.persistence.MongoIntegrationTest;
+
+@Testcontainers(disabledWithoutDocker = true)
+class CheckoutServiceApplicationTests extends MongoIntegrationTest {
 
 	@Test
 	void contextLoads() {
