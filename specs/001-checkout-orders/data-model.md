@@ -116,8 +116,8 @@
 | `key` | String | Unique | Idempotency key from client request |
 | `contentHash` | String | SHA-256 hash | Hash of normalized request body for conflict detection |
 | `orderId` | UUID | FK → Order.id | Reference to order in the committed record |
-| `createdAt` | Instant | Immutable | When key was first seen |
-| `expiresAt` | Instant | TTL | Logical expiry at 24 hours; TTL deletion may be delayed |
+| `createdAt` | Instant | Immutable | Order creation timestamp recorded inside the transaction before commit; persisted only on successful creation |
+| `expiresAt` | Instant | TTL | Exactly `createdAt` + 24 hours; TTL deletion may be delayed |
 
 **Validation Rules**:
 - Key must be non-empty string (client-provided)
@@ -125,6 +125,7 @@
 - Unique index on key prevents multiple records for the same key; contentHash is compared by the use case.
 - Expiration is checked explicitly; an expired record can be atomically replaced even before asynchronous TTL cleanup.
 - The claim and completed record participate in the same transaction as the order and event; a committed record has an orderId.
+- The recorded creation timestamp is taken immediately before persisting the new order. It is not the commit confirmation timestamp; a long transaction reduces the time remaining after confirmation.
 
 **Conflict Resolution**:
 1. Same key + same content → Return existing orderId (idempotent)
@@ -150,7 +151,7 @@ OrderCreatedEvent → Order (1-to-1, one event per order)
 **Transaction Boundary**:
 - Order creation and OrderCreatedEvent persistence happen in a single atomic transaction
 - IdempotencyKey is checked and created within the same transaction
-- A confirmed rollback leaves no order, event, or idempotency record. A communication failure during commit can leave the outcome unknown; the retry uses the same key and content.
+- A confirmed rollback leaves no order, event, or idempotency record and starts no persisted deduplication window. A communication failure during commit can leave the outcome unknown; retry with the same key and content within the window.
 
 ---
 
@@ -275,7 +276,7 @@ OrderCreatedEvent → Order (1-to-1, one event per order)
 
 5. **Atomicity Check**:
    - Both Order and OrderCreatedEvent must persist in single transaction
-   - A confirmed rollback leaves neither record; unknown commit outcomes must not be reported as confirmed rollback. Retrying with the same key and content is safe.
+   - A confirmed rollback leaves neither record; unknown commit outcomes must not be reported as confirmed rollback. Retrying with the same key and content is safe within the window.
 
 ---
 

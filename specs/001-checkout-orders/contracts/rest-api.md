@@ -171,7 +171,7 @@ Idempotency-Key: string (required, unique within 24h)
 
 #### Business Rule Error: 422 Unprocessable Entity
 
-**When**: Request is structurally valid but a referenced product is nonexistent, inactive, or has an invalid price.
+**When**: Request is structurally valid but a referenced product is nonexistent, inactive, or has missing/invalid product-specific data, including its price.
 
 **Status Code**: `422`
 
@@ -189,7 +189,8 @@ Idempotency-Key: string (required, unique within 24h)
 **Possible Errors**:
 - `PRODUCT_NOT_FOUND`: One or more product IDs do not exist in trusted source
 - `PRODUCT_INACTIVE`: One or more products are marked inactive
-- `INVALID_PRODUCT_PRICE`: One or more products have invalid or incompatible prices
+- `INVALID_PRODUCT_PRICE`: One or more products have missing, invalid, or incompatible prices
+- `INVALID_PRODUCT_DATA`: Other required data for an identified product is missing or invalid
 
 **Guarantee**: No order or event created; correct the request or catalog data before retrying.
 
@@ -197,7 +198,7 @@ Idempotency-Key: string (required, unique within 24h)
 
 #### Temporary Failure: 503 Service Unavailable
 
-When the trusted local product source is unavailable or incomplete, return `503` with error code `PRODUCT_DATA_UNAVAILABLE` and `details.retryable: true`; no order or event is confirmed. Retry with the same key after the catalog is restored. If invalid startup configuration prevents the service from starting, correct it and restart the service. When bounded concurrency retries are exhausted, return a retryable `503`; retry with the same key and content.
+When the trusted local product source as a whole is unavailable, malformed, or incomplete so that product data cannot be reliably read, return `503` with error code `PRODUCT_DATA_UNAVAILABLE` and `details.retryable: true`; no order or event is confirmed. A missing or invalid field on a particular identified product is instead a 422 product error. Retry with the same key after the catalog is restored. If invalid startup configuration prevents the service from starting, correct it and restart the service. When bounded concurrency retries are exhausted, return a retryable `503`; retry with the same key and content.
 
 ---
 
@@ -219,7 +220,7 @@ When the trusted local product source is unavailable or incomplete, return `503`
 }
 ```
 
-**Guarantee**: A confirmed rollback leaves no order or event. A communication failure during commit can leave the outcome unknown; the response must not claim rollback or success. Retry the same content with the same idempotency key to recover the existing order or create one if the transaction did not commit.
+**Guarantee**: A confirmed rollback leaves no order or event. A communication failure during commit can leave the outcome unknown; the response must not claim rollback or success. Retry the same content with the same idempotency key within the deduplication window to recover the existing order or create one if the transaction did not commit. After the window, the key can create a new order and deduplication is not guaranteed.
 
 ---
 
@@ -329,7 +330,7 @@ All error responses follow this standard structure:
 
 ### Idempotency Window
 
-- **Duration**: 24 hours from first request with a given key
+- **Duration**: 24 hours from the order creation timestamp recorded inside the transaction immediately before persisting the new order, not from the first request or commit confirmation. The timestamp is persisted only if creation commits; a confirmed rollback starts no persisted window. A long transaction reduces the time remaining after commit confirmation.
 - **Behavior after 24h**: Key can be reused for a new order creation
 - **Comparison**: Product IDs and quantities are normalized independently of item order. Client-provided names, prices, and totals are ignored.
 - **Cleanup**: Logical expiry is checked explicitly and does not depend on asynchronous MongoDB TTL deletion.

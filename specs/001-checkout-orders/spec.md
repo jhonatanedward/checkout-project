@@ -16,6 +16,7 @@
 - Q: A chave será obrigatória? Qual seu escopo e retenção? → A: Obrigatória para criação de pedidos, única nesse fluxo durante uma janela de deduplicação de 24 horas; conflitos de conteúdo serão rejeitados.
 - Decisão de planejamento: uma falha de comunicação durante o commit pode ter resultado indeterminado; o cliente deve repetir com a mesma chave e conteúdo, sem presumir rollback.
 - Decisão de planejamento: comparar identificadores e quantidades independentemente da ordem das linhas; nome, preço e total enviados pelo cliente não participam da comparação.
+- Q: Qual instante inicia a janela de idempotência? → A: O horário de criação registrado na transação, antes do commit. A janela tem 24 horas a partir desse horário; o tempo até a confirmação reduz o tempo restante após o commit.
 
 ## User Scenarios & Testing _(mandatory)_
 
@@ -81,6 +82,7 @@ Como responsável pelo incremento, quero usar dados locais controlados como font
 - Itens repetidos para o mesmo produto: rejeitar a solicitação inteira para evitar consolidação silenciosa ou interpretação ambígua.
 - Preço ou nome do produto alterado entre a criação e a consulta posterior: a consulta deve continuar exibindo o snapshot salvo no pedido.
 - Dados locais de produtos indisponíveis ou incompletos: não usar valores fornecidos pelo cliente nem confirmar preço sem validação; falhar de forma recuperável e permitir nova tentativa após a recuperação.
+- Dado inválido ou ausente de um produto identificado (incluindo preço ausente) rejeita o pedido; indisponibilidade ou corrupção da fonte inteira é uma falha recuperável da fonte.
 - Chave de idempotência ausente: rejeitar a criação. Chave repetida com conteúdo diferente durante as 24 horas: rejeitar sem alterar o pedido original. Após a janela de 24 horas: a chave pode ser usada para uma nova criação.
 - Requisições concorrentes com a mesma chave: persistir no máximo um pedido e um evento na janela; resolver repetição ou conflito conforme o conteúdo, sem leitura de transação abortada.
 - Falha entre a persistência do pedido e do evento: operação toda sem efeito persistido; nunca deixar somente um dos registros.
@@ -98,8 +100,8 @@ Como responsável pelo incremento, quero usar dados locais controlados como font
 - **FR-004**: O checkout MUST calcular no servidor o total com base nos preços unitários validados e nas quantidades solicitadas, sem confiar em total fornecido pelo cliente.
 - **FR-005**: O pedido MUST preservar, para cada item, o nome, a quantidade e o preço unitário vigentes no momento da criação; consultas posteriores MUST retornar esse snapshot mesmo que o produto mude.
 - **FR-006**: O checkout MUST retornar um identificador único para cada pedido criado e permitir consultar o pedido por esse identificador; identificadores desconhecidos MUST ser tratados como não encontrados.
-- **FR-007**: A criação MUST exigir uma chave de idempotência, única no fluxo de criação de pedidos por 24 horas; durante essa janela, uma repetição com o mesmo conteúdo MUST retornar o pedido original e uma repetição com conteúdo diferente MUST ser rejeitada sem alterações. O conteúdo é o conjunto de identificadores e quantidades, independente da ordem das linhas. Após a janela, a chave MAY ser usada para uma nova criação, mesmo que a limpeza de registros expirados ainda não tenha ocorrido.
-- **FR-008**: O checkout MUST persistir o pedido e seu evento de criação como uma única operação atômica; após rollback confirmado, nenhum dos dois registros MUST permanecer. Se o resultado do commit for desconhecido, o checkout MUST NOT afirmar rollback nem sucesso sem confirmação; a repetição com a mesma chave e conteúdo MUST ser segura.
+- **FR-007**: A criação MUST exigir uma chave de idempotência, única no fluxo de criação de pedidos por 24 horas a partir do horário de criação registrado na transação antes do commit. Esse horário só persiste se a criação for confirmada; uma tentativa com rollback confirmado não inicia uma janela persistida. Durante a janela, uma repetição com o mesmo conteúdo MUST retornar o pedido original e uma repetição com conteúdo diferente MUST ser rejeitada sem alterações. O conteúdo é o conjunto de identificadores e quantidades, independente da ordem das linhas. Após a janela, a chave MAY ser usada para uma nova criação, mesmo que a limpeza de registros expirados ainda não tenha ocorrido.
+- **FR-008**: O checkout MUST persistir o pedido e seu evento de criação como uma única operação atômica; após rollback confirmado, nenhum dos dois registros MUST permanecer. Se o resultado do commit for desconhecido, o checkout MUST NOT afirmar rollback nem sucesso sem confirmação; a repetição com a mesma chave e conteúdo MUST ser segura durante a janela de idempotência de 24 horas definida em FR-007.
 - **FR-009**: O evento de criação MUST identificar o pedido criado e o momento da criação. A publicação desse evento em broker não faz parte deste incremento.
 - **FR-010**: Falhas de validação ou indisponibilidade dos dados locais MUST ser comunicadas sem confirmar pedido inexistente, preço não validado ou estado parcial.
 - **FR-011**: Este incremento MUST NOT incluir API de produtos, processamento de pagamentos, reserva de estoque ou publicação em broker.

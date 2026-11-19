@@ -77,7 +77,7 @@ Cada contagem deve ser 1. `order_events` é a outbox; não existe worker neste i
 
 ## Falhas e recuperação
 
-- Dados locais indisponíveis ou incompletos não podem produzir pedido ou evento. Após restaurar os dados, repita com a mesma chave. Se a configuração inválida impedir a inicialização, corrija-a e reinicie o serviço.
-- Uma falha com rollback confirmado não deixa pedido nem evento. Se a comunicação falhar durante o commit, o resultado pode ser desconhecido; não suponha rollback. Repita com a mesma chave e conteúdo.
-- A janela de idempotência é verificada pela expiração registrada, independentemente do momento da limpeza TTL.
+- Fonte local indisponível ou incompleta como um todo não pode produzir pedido ou evento e, com o serviço ativo, retorna 503. Dado ausente ou inválido de um produto específico retorna 422. Após restaurar os dados, repita com a mesma chave. Se a configuração inválida impedir a inicialização, corrija-a e reinicie o serviço.
+- Uma falha com rollback confirmado não deixa pedido nem evento. Se a comunicação falhar durante o commit, o resultado pode ser desconhecido; não suponha rollback. Repita com a mesma chave e conteúdo dentro da janela. Após seu vencimento, a repetição pode criar outro pedido.
+- A janela começa no horário de criação registrado na transação antes do commit, não no horário de confirmação. A expiração é verificada independentemente do momento da limpeza TTL; uma transação demorada reduz o tempo restante após a confirmação.
 - Os testes de integração alteram a fonte local de teste depois da criação para verificar o snapshot; não há endpoint administrativo de produtos.

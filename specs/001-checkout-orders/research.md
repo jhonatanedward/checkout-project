@@ -25,7 +25,7 @@
 
 ### Failure Scenario Handling
 - If a write fails and rollback is confirmed, neither order, event, nor idempotency record remains.
-- A network failure during commit can leave the outcome unknown. Report a retryable failure without claiming rollback; retry with the same key and content to resolve the committed order or create one if no commit occurred.
+- A network failure during commit can leave the outcome unknown. Report a retryable failure without claiming rollback; retry with the same key and content within the window to resolve the committed order or create one if no commit occurred.
 
 ### Alternatives Considered
 1. **Manual MongoDB Session Management**: More verbose, error-prone; @Transactional is preferred.
@@ -37,13 +37,13 @@
 ## Research Topic 2: Idempotency Key Management Strategy (24-Hour Deduplication Window)
 
 ### Decision
-**Chosen**: Store one record per key in `idempotency_keys` with a unique key index, a hash of normalized product IDs and quantities, and `expiresAt` set 24 hours after creation. An `expiresAt` TTL index is only asynchronous cleanup; application logic checks expiration and atomically replaces an expired record without waiting for TTL deletion.
+**Chosen**: Store one record per key in `idempotency_keys` with a unique key index, a hash of normalized product IDs and quantities, and `expiresAt` set to the creation timestamp plus 24 hours. Capture the timestamp in the transaction immediately before persisting the new order; it becomes durable only when the transaction commits. The window starts before commit confirmation, so a long transaction reduces the time remaining after confirmation. A confirmed rollback leaves no persisted window. An `expiresAt` TTL index is only asynchronous cleanup; application logic checks expiration and atomically replaces an expired record without waiting for TTL deletion.
 
 ### Rationale
 1. **Atomic Conflict Detection**: A unique index on the key prevents simultaneous records with different hashes.
 2. **Cleanup**: TTL deletion may be delayed; explicit expiration makes the 24-hour boundary independent of it.
 3. **Concurrency**: After a duplicate-key/write conflict aborts a transaction, re-read or retry in a fresh transaction; bound retries and report exhaustion as retryable.
-4. **Failure Handling**: The key claim, order, and event commit together; an unknown commit outcome is resolved by a same-key retry.
+4. **Failure Handling**: The key claim, order, and event commit together; an unknown commit outcome is resolved by a same-key retry within the deduplication window.
 
 ### Schema (idempotency_keys collection)
 ```json

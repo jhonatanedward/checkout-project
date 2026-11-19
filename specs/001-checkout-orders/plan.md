@@ -18,7 +18,7 @@ Implementar o incremento P1 de criação e consulta de pedidos em um serviço de
 
 **Transactions**: A Spring-managed infrastructure adapter uses `@Transactional` and `MongoTransactionManager` backed by the same `MongoDatabaseFactory` as `MongoTemplate`. The framework-free use case executes the atomic work through a transaction port; order, outbox event, and idempotency record share the transaction. A replica set is required.
 
-**Testing**: JUnit 5, Testcontainers (MongoDB), Mockito
+**Testing**: JUnit Jupiter 6, Testcontainers (MongoDB), Mockito
 
 **Target Platform**: Web service (Spring Boot)
 
@@ -30,9 +30,9 @@ Implementar o incremento P1 de criação e consulta de pedidos em um serviço de
 
 **Scale/Scope**: Foco inicial no P1; extensível para pagamentos, estoque, broker em incrementos futuros
 
-**Idempotency and failures**: Normalize product IDs and quantities independently of item order. A unique index on the key serializes claims; expiry is checked explicitly and an expired record may be replaced atomically without waiting for TTL cleanup. Duplicate-key/write conflicts are resolved after the failed transaction ends by retrying in a fresh transaction or re-reading the committed record; retries are bounded and exhaustion is reported as retryable. If commit outcome is unknown, do not claim rollback or create a new key: report a retryable error and retry with the same key and content.
+**Idempotency and failures**: Normalize product IDs and quantities independently of item order. Set the creation timestamp inside the transaction before commit, immediately before persisting the new order, and set expiration to that timestamp plus 24 hours; this timestamp and the key are durable only if creation commits. A long transaction shortens the remaining window after confirmation. A unique index on the key serializes claims; expiry is checked explicitly and an expired record may be replaced atomically without waiting for TTL cleanup. Duplicate-key/write conflicts are resolved after the failed transaction ends by retrying in a fresh transaction or re-reading the committed record; retries are bounded and exhaustion is reported as retryable. If commit outcome is unknown, do not claim rollback or create a new key: report a retryable error and retry with the same key and content within the window; after expiration, deduplication is not guaranteed.
 
-**Catalog and money**: The local controlled catalog uses one configured currency; positive prices and totals must be exactly representable to two decimal places without rounding. Missing, invalid, or unavailable catalog data fails explicitly; a corrected configuration may require a service restart. Tests simulate temporary catalog unavailability and recovery without requiring production hot reload.
+**Catalog and money**: The local controlled catalog uses one configured currency; positive prices and totals must be exactly representable to two decimal places without rounding. A specific product with absent/invalid data produces a product validation error (422); an unavailable, malformed, or incomplete source as a whole produces a recoverable source failure (503 when the service is running). Invalid startup configuration may require correction and a service restart. Tests simulate temporary catalog unavailability and recovery without requiring production hot reload.
 
 ## Constitution Check
 
